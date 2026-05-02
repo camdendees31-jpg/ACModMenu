@@ -1,0 +1,178 @@
+# ============================================================
+#  .github/workflows/build.yml
+#
+#  Builds libACModMenu.so for arm64-v8a on every push to main
+#  and on every pull request.  On a tagged release (v*.*.*) it
+#  also uploads the .so as a GitHub Release asset so you can
+#  download it and drop it straight into:
+#
+#    Quest 3S  →  Internal shared storage
+#              →  Android/data/woosterGames.animalCompany/nativemods/
+#
+#  Triggers
+#  ────────
+#  • push to main          → build + upload build artifact
+#  • pull_request to main  → build only (no release upload)
+#  • push tag v*.*.*       → build + create GitHub Release + attach .so
+# ============================================================
+
+name: Build libACModMenu.so
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:     [ 'v*.*.*' ]          # e.g. v1.0.0 triggers a release
+  pull_request:
+    branches: [ main, master ]
+
+# Prevent concurrent builds on the same ref from piling up
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: arm64-v8a Release Build
+    runs-on: ubuntu-22.04          # pinned OS for reproducibility
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive     # pulls BNM / Dobby if added as submodules
+
+      # ── 2. NDK setup ────────────────────────────────────────
+      #  The ubuntu-22.04 runner ships several NDK versions.
+      #  We pin r25c (25.2.9519653) for stability; change the
+      #  version string if you need a different NDK.
+      - name: Set up Android NDK r25c
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+          add-to-path:  true
+
+      # ── 3. CMake ─────────────────────────────────────────────
+      - name: Set up CMake 3.25
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.25'
+
+      # ── 4. Cache CMake build directory ───────────────────────
+      #  Caches the CMake configure + compile cache between runs.
+      #  The cache key includes the NDK version and source hash.
+      - name: Cache CMake output
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: cmake-arm64-${{ steps.setup-ndk.outputs.ndk-version }}-${{ hashFiles('CMakeLists.txt', 'mod.cpp', 'BNMSetup.h') }}
+          restore-keys: |
+            cmake-arm64-${{ steps.setup-ndk.outputs.ndk-version }}-
+
+      # ── 5. Clone BNM (if not a submodule) ───────────────────
+      #  Remove this step if you added BNM as a git submodule.
+      - name: Clone BNM headers
+        run: |
+          if [ ! -d "BNM/include" ]; then
+            git clone --depth=1 https://github.com/ByNameModding/BNM-Android BNM
+            echo "BNM cloned."
+          else
+            echo "BNM already present (submodule)."
+          fi
+
+      # ── 6. Clone Dobby (optional, comment out if not needed) ─
+      - name: Clone and build Dobby (arm64)
+        run: |
+          if [ ! -d "Dobby" ]; then
+            git clone --depth=1 https://github.com/jmpews/Dobby Dobby
+          fi
+          cd Dobby
+          cmake -B build_arm64 \
+            -DCMAKE_TOOLCHAIN_FILE=${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-29 \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDOBBY_BUILD_SHARED=OFF \
+            -DDOBBY_BUILD_STATIC=ON
+          cmake --build build_arm64 --config Release
+          mkdir -p ../Dobby/libs/arm64-v8a
+          cp build_arm64/libdobby.a ../Dobby/libs/arm64-v8a/
+          cp include/dobby.h ../Dobby/include/ 2>/dev/null || true
+          echo "Dobby built."
+
+      # ── 7. CMake configure ───────────────────────────────────
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE=${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-29 \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_VERBOSE_MAKEFILE=ON
+
+      # ── 8. Build ─────────────────────────────────────────────
+      - name: Build libACModMenu.so
+        run: |
+          cmake --build build --config Release -- -j$(nproc)
+          echo "Build complete."
+          ls -lh build/libACModMenu.so
+
+      # ── 9. Verify the .so is a valid arm64 ELF ───────────────
+      - name: Verify ELF architecture
+        run: |
+          file build/libACModMenu.so
+          # Must print: ELF 64-bit LSB shared object, ARM aarch64
+          file build/libACModMenu.so | grep -q "aarch64" \
+            && echo "✅ Correct architecture: arm64/aarch64" \
+            || (echo "❌ Wrong architecture!" && exit 1)
+
+          # Confirm JNI_OnLoad is exported
+          ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm \
+            --defined-only build/libACModMenu.so | grep JNI_OnLoad \
+            && echo "✅ JNI_OnLoad exported" \
+            || echo "⚠️  JNI_OnLoad not found in symbol table"
+
+      # ── 10. Upload artifact (every successful build) ─────────
+      #  Available under Actions → your run → Artifacts
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libACModMenu-arm64-${{ github.sha }}
+          path: build/libACModMenu.so
+          retention-days: 30      # keep for 30 days
+
+      # ── 11. GitHub Release (tag pushes only) ─────────────────
+      #  Triggered when you push a tag like: git tag v1.2.3 && git push --tags
+      #  Creates a release and attaches the .so directly.
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "ACModMenu ${{ github.ref_name }}"
+          body: |
+            ## Animal Company Mod Menu — ${{ github.ref_name }}
+
+            ### Install
+            1. Download `libACModMenu.so` below.
+            2. Copy it to your Quest via USB / wireless ADB:
+               ```
+               adb push libACModMenu.so \
+                 /sdcard/Android/data/woosterGames.animalCompany/nativemods/
+               ```
+               *Or* drag-and-drop in Windows Explorer to:
+               `Internal shared storage → Android → data → woosterGames.animalCompany → nativemods`
+            3. Launch Animal Company and hold **Y** for 0.75 s.
+
+            ### Changes
+            ${{ github.event.head_commit.message }}
+
+            ---
+            Built from commit `${{ github.sha }}` · NDK r25c · arm64-v8a
+          files: build/libACModMenu.so
+          draft:      false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # auto-provided, no setup needed
